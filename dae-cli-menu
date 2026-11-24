@@ -17,6 +17,7 @@ usage() {
 用法: dm [子命令] [参数...]
 
   不带参数                         交互式菜单（原行为）
+  sub [list|add|remove] [标签]     管理订阅（新增/删除；链接从提示读，不进 shell 历史）
   subs                             列出订阅标签
   status <订阅>                    看某个订阅当前的规则
   nodes <订阅> [--cached]          列出该订阅的节点
@@ -35,7 +36,7 @@ if [ "$#" -eq 0 ]; then
 fi
 
 case "$1" in
-    interactive|i|subs|subscriptions|nodes|only|exclude|restore|reset|status|apply)
+    interactive|i|subs|subscriptions|sub|nodes|only|exclude|restore|reset|status|apply)
         sub=$1
         shift
         ;;

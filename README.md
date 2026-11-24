@@ -96,6 +96,7 @@ $ sudo python3 dae_cli.py subs
 | `reset <sub>` | back to all nodes |
 | `status <sub>` | show the current rule |
 | `apply <sub> [--reload]` | write the group file; `--reload` restarts dae |
+| `sub [list\|add\|remove] [tag]` | manage the subscriptions themselves (see below) |
 
 `<sel>` accepts numbers (`3`), ranges (`3-8`) and a name regex (`--match '流量|到期|官网'`).
 `--cached` uses the cached node list instead of fetching the subscription again.
@@ -140,6 +141,43 @@ Privacy / safety notes:
 - it runs entirely inside your home directory: **never run `ds` via sudo**, it would write
   root-owned files into `/root` and the user unit would stop matching;
 - the local server binds `127.0.0.1` only.
+
+## Managing subscriptions
+
+`dm` with no arguments now opens a two-level menu; subscription management is the first entry:
+
+```
+=== dae-cli ===
+  1) 订阅管理（列表 / 新增 / 删除）
+  2) 节点规则（选择哪些节点进代理组）
+
+=== 订阅管理 ===
+    #  标签            节点  链接
+    1.  kitty             44  https-file://m1.tohno-1.top/oosaka…
+    2.  yy                44  http-file://127.0.0.1:18080/links.…
+  1) 新增订阅   2) 删除订阅   3) 刷新节点数   0) 返回
+```
+
+The same thing without the menu:
+
+```console
+$ sudo dm sub list                     # tag / cached node count / masked URL
+$ sudo dm sub add                      # prompts for tag + URL, then validates and reloads
+$ sudo dm sub add myairport            # tag given, URL still prompted
+$ sudo dm sub remove myairport
+```
+
+Design notes:
+
+- **the URL is read from a prompt, never from argv** — otherwise it would sit in `ps`
+  output and shell history;
+- it is only ever printed **masked** (`scheme://host/first6…`);
+- before every edit the file is copied next to itself (`20-subscription.dae.bak-<ts>`)
+  and owner/mode are preserved; then `dae validate` runs and **rolls back** on failure;
+- `add` appends to the `subscription { }` block that already exists (or creates
+  `config.d/20-subscription.dae` when there is none);
+- `remove` drops just that one line, and the block itself once it is empty; the cached
+  node list and node rule for that tag are cleared too.
 
 ## Supported subscription formats
 

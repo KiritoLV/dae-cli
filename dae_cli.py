@@ -15,13 +15,14 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 MAX_SUBSCRIPTION_SIZE = 10 * 1024 * 1024
 DEFAULT_GROUP = "proxy"
 DEFAULT_OUTPUT = "/etc/dae/config.d/50-group.dae"
@@ -577,7 +578,7 @@ def print_node_selection(nodes: list[str], rule: dict[str, Any]) -> None:
         print(f"{marker} {index:4d}  {name}")
 
 
-def command_interactive(args: argparse.Namespace, state: dict[str, Any]) -> None:
+def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
     subscriptions = {
         tag: item for tag, item in read_subscriptions(Path(args.config)).items() if item["tagged"]
     }
@@ -632,6 +633,311 @@ def command_interactive(args: argparse.Namespace, state: dict[str, Any]) -> None
     command_apply(args, state)
 
 
+# ------------------------------------------------------- subscription management
+
+
+def mask_url(url: str) -> str:
+    """Show enough to tell subscriptions apart, never the token."""
+    core = url.split("#", 1)[0]
+    scheme = ""
+    rest = core
+    match = re.match(r"^([a-zA-Z0-9+.-]+://)(.*)$", core)
+    if match:
+        scheme, rest = match.groups()
+    host, _, tail = rest.partition("/")
+    tail = tail.split("?")[0]
+    if len(tail) > 8:
+        tail = tail[:6] + "…"
+    shown = f"{scheme}{host}"
+    if tail:
+        shown += f"/{tail}"
+    if "?" in core:
+        shown += "?…"
+    return shown
+
+
+def code_mask(text: str) -> bytearray:
+    """1 where the character is real config code, 0 inside a comment (or newline)."""
+    mask = bytearray(len(text))
+    quote: str | None = None
+    escaped = False
+    comment = False
+    for index, char in enumerate(text):
+        if comment:
+            if char == "\n":
+                comment = False
+            continue
+        if escaped:
+            escaped = False
+            mask[index] = 1
+            continue
+        if quote:
+            if char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            mask[index] = 1
+            continue
+        if char in "'\"":
+            quote = char
+            mask[index] = 1
+        elif char == "#":
+            comment = True
+        else:
+            mask[index] = 1
+    return mask
+
+
+def find_block_spans(text: str, name: str) -> list[tuple[int, int, int]]:
+    """(block_start, body_start, body_end) offsets into the ORIGINAL text.
+
+    Unlike find_blocks() this keeps positions usable for editing, so commented-out
+    braces do not shift anything.
+    """
+    mask = code_mask(text)
+    spans: list[tuple[int, int, int]] = []
+    pattern = re.compile(r"(?<![\w.-])" + re.escape(name) + r"\s*\{")
+    for match in pattern.finditer(text):
+        brace = match.end() - 1
+        if not mask[brace]:
+            continue
+        depth = 0
+        for pos in range(brace, len(text)):
+            if not mask[pos]:
+                continue
+            if text[pos] == "{":
+                depth += 1
+            elif text[pos] == "}":
+                depth -= 1
+                if depth == 0:
+                    spans.append((match.start(), brace + 1, pos))
+                    break
+    return spans
+
+
+def block_indent(text: str, body_start: int, body_end: int) -> str:
+    for line in text[body_start:body_end].splitlines():
+        if line.strip():
+            return line[: len(line) - len(line.lstrip())]
+    return "    "
+
+
+def item_tag(line: str) -> str | None:
+    match = ITEM_RE.match(line)
+    if not match or not match.group("tag"):
+        return None
+    return unquote(match.group("tag"))
+
+
+def dae_key(tag: str) -> str:
+    """Bare key when it is a plain identifier, quoted otherwise (matches existing configs)."""
+    return tag if re.fullmatch(r"[A-Za-z_][\w.-]*", tag) else dae_quote(tag)
+
+
+def add_subscription(text: str, tag: str, url: str) -> str:
+    """Append one item to the first subscription block, or create the block."""
+    entry = f"{dae_key(tag)}: {dae_quote(url)}\n"
+    spans = find_block_spans(text, "subscription")
+    if not spans:
+        prefix = "" if not text or text.endswith("\n") else "\n"
+        return f"{text}{prefix}subscription {{\n    {entry}}}\n"
+    _, body_start, body_end = spans[0]
+    indent = block_indent(text, body_start, body_end)
+    head = text[:body_end]
+    if not head.endswith("\n"):
+        head += "\n"
+    return f"{head}{indent}{entry}{text[body_end:]}"
+
+
+def remove_subscription(text: str, tag: str) -> tuple[str, int]:
+    """Delete the item line(s) for tag; drop the block when nothing is left."""
+    removed = 0
+    for block_start, body_start, body_end in reversed(find_block_spans(text, "subscription")):
+        body = text[body_start:body_end]
+        lines = body.splitlines(keepends=True)
+        kept = [line for line in lines if item_tag(line) != tag]
+        hit = len(lines) - len(kept)
+        if not hit:
+            continue
+        removed += hit
+        if any(line.strip() for line in kept):
+            text = f"{text[:body_start]}{''.join(kept)}{text[body_end:]}"
+        else:
+            text = f"{text[:block_start]}{text[body_end + 1:]}"
+    return text, removed
+
+
+def subscription_target(entry: Path) -> Path:
+    """Where a new subscription goes: the file that already has a block, else config.d."""
+    entry = entry.expanduser()
+    for path in config_files(entry):
+        if find_block_spans(path.read_text(encoding="utf-8"), "subscription"):
+            return path
+    config_dir = entry.parent / "config.d"
+    if config_dir.is_dir():
+        existing = sorted(config_dir.glob("*subscription*.dae"))
+        return existing[0] if existing else config_dir / "20-subscription.dae"
+    return entry
+
+
+def backup_and_write(path: Path, text: str) -> Path | None:
+    """Write text, keeping owner/mode, after copying the old file next to it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stat = path.stat() if path.exists() else None
+    backup: Path | None = None
+    if stat:
+        backup = path.with_name(f"{path.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        shutil.copy2(path, backup)
+    atomic_write(path, text)
+    if stat:
+        try:
+            os.chmod(path, stat.st_mode & 0o7777)
+            os.chown(path, stat.st_uid, stat.st_gid)
+        except (PermissionError, AttributeError):
+            pass
+    return backup
+
+
+def apply_config_change(args: argparse.Namespace, path: Path, backup: Path | None) -> None:
+    try:
+        validate_and_reload(args, getattr(args, "reload", False))
+    except CliError:
+        if backup is not None and backup.exists():
+            shutil.copy2(backup, path)
+            print(f"rolled back to {backup}", file=sys.stderr)
+        raise
+
+
+def fetch_and_count(args: argparse.Namespace, state: dict[str, Any], tag: str) -> list[str]:
+    subscriptions = read_subscriptions(Path(args.config))
+    item = subscriptions.get(tag)
+    if item is None:
+        raise CliError(f"没有这个订阅: {tag!r}")
+    nodes = parse_nodes(fetch_subscription(item, Path(args.config)))
+    state["nodes"][tag] = nodes
+    save_state(Path(args.state), state)
+    return nodes
+
+
+def print_subscription_table(entry: Path, state: dict[str, Any]) -> None:
+    subscriptions = read_subscriptions(entry)
+    if not subscriptions:
+        print("  （还没有订阅）")
+        return
+    print(f"   {'#':>2}  标签            节点  链接")
+    for index, (tag, item) in enumerate(subscriptions.items(), 1):
+        cached = len(state.get("nodes", {}).get(tag, []))
+        print(f"   {index:>2}.  {tag:<14} {cached or '-':>4}  {mask_url(item['url'])}")
+
+
+def refresh_all_counts(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    for tag in read_subscriptions(Path(args.config)):
+        try:
+            nodes = fetch_and_count(args, state, tag)
+            print(f"  {tag}: {len(nodes)} 个节点")
+        except (CliError, OSError) as exc:
+            print(f"  {tag}: 抓取失败（{exc}）")
+
+
+def command_sub(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    action = getattr(args, "action", None) or "menu"
+    entry = Path(args.config)
+    if action == "menu":
+        command_sub_menu(args, state)
+        return
+    if action == "list":
+        print_subscription_table(entry, state)
+        return
+
+    if action == "add":
+        tag = (getattr(args, "tag", None) or prompt("订阅标签（字母/数字/_ . -，例如 airport2）: ")).strip()
+        if not re.fullmatch(r"[A-Za-z_][\w.-]*", tag):
+            raise CliError(f"无效标签: {tag!r}（只能用字母、数字、_ . -）")
+        if tag in read_subscriptions(entry):
+            raise CliError(f"订阅 {tag!r} 已存在（要换链接请先删除再新增）")
+        url = prompt(f"订阅链接（{tag}）: ")
+        if not re.match(r"^[a-zA-Z0-9+.-]+://", url):
+            raise CliError("链接必须以 scheme:// 开头，例如 https-file://… 或 http-file://…")
+        target = subscription_target(entry)
+        text = target.read_text(encoding="utf-8") if target.exists() else ""
+        backup = backup_and_write(target, add_subscription(text, tag, url))
+        print(f"已写入 {target}" + (f"（备份 {backup.name}）" if backup else ""))
+        apply_config_change(args, target, backup)
+        print(f"订阅 {tag} 已添加：{mask_url(url)}")
+        if prompt_yes_no("现在抓取一次，确认链接可用？", True):
+            print(f"{tag}: {len(fetch_and_count(args, state, tag))} 个节点")
+        return
+
+    if action == "remove":
+        subscriptions = read_subscriptions(entry)
+        if not subscriptions:
+            raise CliError("配置里没有订阅可删")
+        tag = (getattr(args, "tag", None) or prompt(f"要删除的标签（{' / '.join(subscriptions)}）: ")).strip()
+        item = subscriptions.get(tag)
+        if item is None:
+            raise CliError(f"没有这个订阅: {tag!r}")
+        path = Path(item["file"])
+        new_text, removed = remove_subscription(path.read_text(encoding="utf-8"), tag)
+        if not removed:
+            raise CliError(f"在 {path} 里没找到 {tag!r} 的条目")
+        if not prompt_yes_no(f"确认从 {path.name} 删除订阅 {tag}？"):
+            print("已取消。")
+            return
+        backup = backup_and_write(path, new_text)
+        print(f"已写入 {path}" + (f"（备份 {backup.name}）" if backup else ""))
+        apply_config_change(args, path, backup)
+        state["nodes"].pop(tag, None)
+        state["rules"].pop(tag, None)
+        save_state(Path(args.state), state)
+        print(f"订阅 {tag} 已删除。")
+        return
+
+    raise CliError(f"unknown sub action: {action!r}")
+
+
+def command_sub_menu(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    entry = Path(args.config)
+    while True:
+        print("\n=== 订阅管理 ===")
+        print_subscription_table(entry, state)
+        print("\n  1) 新增订阅   2) 删除订阅   3) 刷新节点数   0) 返回")
+        choice = prompt("选择 [0]: ") or "0"
+        if choice == "0":
+            return
+        namespace = argparse.Namespace(**{**vars(args), "tag": None})
+        try:
+            if choice == "1":
+                namespace.action = "add"
+                command_sub(namespace, state)
+            elif choice == "2":
+                namespace.action = "remove"
+                command_sub(namespace, state)
+            elif choice == "3":
+                refresh_all_counts(args, state)
+            else:
+                print("无效选项。")
+        except (CliError, OSError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+
+
+def command_interactive(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    while True:
+        print("\n=== dae-cli ===")
+        print("  1) 订阅管理（列表 / 新增 / 删除）")
+        print("  2) 节点规则（选择哪些节点进代理组）")
+        print("  0) 退出")
+        choice = prompt("选择 [0]: ") or "0"
+        if choice == "0":
+            return
+        if choice == "1":
+            command_sub_menu(args, state)
+        elif choice == "2":
+            command_node_flow(args, state)
+            return
+        else:
+            print("无效选项。")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dae-cli", description=__doc__)
     parser.add_argument("-c", "--config", default="/etc/dae/config.dae", help="dae entry config")
@@ -681,6 +987,13 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--policy", help="dae group policy")
     apply.add_argument("--reload", action="store_true", help="reload dae after validation")
     apply.set_defaults(func=command_apply)
+
+    manage = sub.add_parser("sub", help="list / add / remove subscriptions in the dae config")
+    manage.add_argument("action", nargs="?", choices=["list", "add", "remove"], default="menu")
+    manage.add_argument("tag", nargs="?", help="subscription tag (prompted when omitted)")
+    manage.add_argument("--reload", action="store_true", help="reload dae after the change")
+    manage.set_defaults(func=command_sub)
+
     return parser
 
 

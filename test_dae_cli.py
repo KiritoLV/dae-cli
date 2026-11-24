@@ -73,7 +73,7 @@ class DaeCliTests(unittest.TestCase):
                 state=str(root / "state.json"),
                 dae_bin="dae",
             )
-            answers = iter(["1", "2", "1", "", "y", "n"])
+            answers = iter(["2", "1", "2", "1", "", "y", "n"])
             with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
                 with mock.patch("dae_cli.command_apply") as apply:
                     state = dae_cli.empty_state()
@@ -83,6 +83,106 @@ class DaeCliTests(unittest.TestCase):
             self.assertEqual(args.output, "/etc/dae/config.d/50-group.dae")
             self.assertFalse(args.reload)
             apply.assert_called_once_with(args, state)
+
+
+class SubscriptionManageTests(unittest.TestCase):
+    CONFIG = (
+        "subscription {\n"
+        "airport: 'https-file://example.com/sub/token-aaaa'\n"
+        "local: 'http-file://127.0.0.1:18080/links.txt'\n"
+        "}\n"
+    )
+
+    def test_mask_url_keeps_host_and_hides_token(self):
+        masked = dae_cli.mask_url("https-file://example.com/sub/abcdef123456")
+        self.assertIn("https-file://example.com", masked)
+        self.assertNotIn("abcdef123456", masked)
+
+    def test_add_appends_into_existing_block(self):
+        text = dae_cli.add_subscription(self.CONFIG, "new", "https://new.example/x")
+        self.assertTrue(text.startswith("subscription {\n"))
+        self.assertIn("new: \"https://new.example/x\"\n", text)
+        self.assertEqual(text.count("subscription {"), 1)
+
+    def test_add_creates_block_when_missing(self):
+        text = dae_cli.add_subscription("", "new", "https://new.example/x")
+        self.assertEqual(text, 'subscription {\n    new: "https://new.example/x"\n}\n')
+
+    def test_remove_drops_only_that_item(self):
+        text, removed = dae_cli.remove_subscription(self.CONFIG, "airport")
+        self.assertEqual(removed, 1)
+        self.assertNotIn("airport", text)
+        self.assertIn("local: 'http-file://127.0.0.1:18080/links.txt'", text)
+
+    def test_remove_drops_block_when_it_becomes_empty(self):
+        text, removed = dae_cli.remove_subscription(self.CONFIG, "airport")
+        text, removed2 = dae_cli.remove_subscription(text, "local")
+        self.assertEqual(removed2, 1)
+        self.assertNotIn("subscription", text)
+
+    def test_commented_block_is_ignored(self):
+        text = "# subscription { gone: 'https://x/y' }\nsubscription {\nkeep: 'https://k/v'\n}\n"
+        spans = dae_cli.find_block_spans(text, "subscription")
+        self.assertEqual(len(spans), 1)
+        self.assertEqual(dae_cli.remove_subscription(text, "gone")[1], 0)
+
+    def test_target_prefers_file_with_block(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "config.d").mkdir()
+            (root / "config.dae").write_text("include { config.d/*.dae }\n", encoding="utf-8")
+            sub = root / "config.d" / "20-subscription.dae"
+            sub.write_text(self.CONFIG, encoding="utf-8")
+            self.assertEqual(dae_cli.subscription_target(root / "config.dae").resolve(), sub.resolve())
+
+    def test_add_then_read_back(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            entry = root / "config.dae"
+            entry.write_text(self.CONFIG, encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(entry), state=str(root / "state.json"), dae_bin="no-such-dae-binary", reload=False
+            )
+            state = dae_cli.empty_state()
+            answers = iter(["added", "https://added.example/abc", "n"])
+            with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
+                dae_cli.command_sub(argparse.Namespace(**{**vars(args), "action": "add", "tag": None}), state)
+            subscriptions = dae_cli.read_subscriptions(entry)
+            self.assertEqual(subscriptions["added"]["url"], "https://added.example/abc")
+            self.assertEqual(set(subscriptions), {"airport", "local", "added"})
+            self.assertTrue(list(root.glob("config.dae.bak-*")), "a backup should be written")
+
+    def test_remove_command_deletes_and_clears_state(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            entry = root / "config.dae"
+            entry.write_text(self.CONFIG, encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(entry), state=str(root / "state.json"), dae_bin="no-such-dae-binary", reload=False
+            )
+            state = dae_cli.empty_state()
+            state["nodes"]["airport"] = ["HK 01"]
+            state["rules"]["airport"] = {"mode": "exclude", "names": ["HK 01"]}
+            with mock.patch("builtins.input", side_effect=lambda _: "y"):
+                dae_cli.command_sub(argparse.Namespace(**{**vars(args), "action": "remove", "tag": "airport"}), state)
+            self.assertNotIn("airport", dae_cli.read_subscriptions(entry))
+            self.assertNotIn("airport", state["nodes"])
+            self.assertNotIn("airport", state["rules"])
+
+    def test_add_rejects_duplicate_tag(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            entry = root / "config.dae"
+            entry.write_text(self.CONFIG, encoding="utf-8")
+            args = argparse.Namespace(
+                config=str(entry), state=str(root / "state.json"), dae_bin="no-such-dae-binary", reload=False
+            )
+            with mock.patch("builtins.input", side_effect=lambda _: "https://dup.example/x"):
+                with self.assertRaises(dae_cli.CliError):
+                    dae_cli.command_sub(
+                        argparse.Namespace(**{**vars(args), "action": "add", "tag": "airport"}),
+                        dae_cli.empty_state(),
+                    )
 
 
 if __name__ == "__main__":
