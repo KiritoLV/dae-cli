@@ -74,7 +74,7 @@ class DaeCliTests(unittest.TestCase):
                 state=str(root / "state.json"),
                 dae_bin="dae",
             )
-            answers = iter(["2", "1", "2", "1", "", "y", "0"])
+            answers = iter(["2", "1", "2", "1", "", "y", "0", "0"])
             with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
                 with mock.patch("dae_cli.command_apply") as apply:
                     state = dae_cli.empty_state()
@@ -258,8 +258,12 @@ class ApplyModeTests(unittest.TestCase):
     """热重载 vs 重启服务：两条路都要能选到。"""
 
     def test_default_is_hot_reload(self):
-        with mock.patch("builtins.input", side_effect=lambda _: ""):
+        with mock.patch("builtins.input", side_effect=lambda _: "1"):
             self.assertEqual(dae_cli.choose_apply_mode(), (True, False))
+
+    def test_cancel_means_no_action(self):
+        with mock.patch("builtins.input", side_effect=lambda _: "0"):
+            self.assertEqual(dae_cli.choose_apply_mode(), (False, False))
 
     def test_restart_mode(self):
         with mock.patch("builtins.input", side_effect=lambda _: "2"):

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 MAX_SUBSCRIPTION_SIZE = 10 * 1024 * 1024
 DEFAULT_GROUP = "proxy"
 DEFAULT_OUTPUT = "/etc/dae/config.d/50-group.dae"
@@ -566,16 +566,19 @@ def command_status(args: argparse.Namespace, state: dict[str, Any]) -> None:
 
 def choose_apply_mode() -> tuple[bool, bool]:
     """(reload, restart) -- hot reload is fast, restart survives a dead current node."""
-    print("\ndae 怎么生效？")
-    print("   1) 热重载  dae reload        快、不重启进程 —— 当前节点还能用时选这个")
-    print("   2) 重启服务 restart dae      慢几秒，但当前节点已经坏了也不会卡死")
-    print("   0) 先不动                    我稍后自己处理")
-    choice = (prompt("选择 [1]: ") or "1").strip()
-    if choice == "2":
+    choice = pick(
+        "写好了，dae 怎么生效？",
+        [
+            "热重载 dae reload —— 快、不重启进程（当前节点还能用时选这个）",
+            "重启服务 systemctl restart dae —— 慢几秒（当前节点已经坏了时选这个）",
+            "先不动 —— 我稍后自己处理",
+        ],
+    )
+    if choice == 0:
+        return True, False
+    if choice == 1:
         return False, True
-    if choice == "0":
-        return False, False
-    return True, False
+    return False, False
 
 
 def command_apply(args: argparse.Namespace, state: dict[str, Any]) -> None:
@@ -784,35 +787,24 @@ def print_node_selection(nodes: list[str], rule: dict[str, Any]) -> None:
         print(f"{marker} {index:4d}  {name}")
 
 
-def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
-    subscriptions = {
-        tag: item for tag, item in read_subscriptions(Path(args.config)).items() if item["tagged"]
-    }
-    if not subscriptions:
-        raise CliError("配置中没有带标签的订阅")
+NODE_MODES = ["使用全部节点", "排除部分节点", "仅使用选中的节点", "保持当前规则"]
+BACK = "← 返回"
 
-    tags = list(subscriptions)
-    given = getattr(args, "tag", None)
-    if given in subscriptions:
-        tag = given
-    else:
-        choice = pick("dae 订阅节点管理 — 选择订阅", tags)
-        if choice is None:
-            print("已取消。")
-            return
-        tag = tags[choice]
+
+def _node_rule_step(args: argparse.Namespace, state: dict[str, Any], tag: str) -> bool:
+    """One pass of the node-rule wizard.
+
+    True  = finished (group file written), back to whatever called us.
+    False = user pressed 返回 / cancelled, caller decides where to go back to.
+    """
     args.tag = tag
     print(f"\n正在获取 {tag} 的节点...")
     nodes = get_nodes(args, state, refresh=True)
     print(f"获取到 {len(nodes)} 个节点。\n")
 
-    mode_choice = pick(
-        f"{tag} — 规则模式",
-        ["使用全部节点", "排除部分节点", "仅使用选中的节点", "保持当前规则"],
-    )
-    if mode_choice is None:
-        print("已取消。")
-        return
+    mode_choice = pick(f"{tag} — 规则模式", NODE_MODES + [BACK])
+    if mode_choice is None or mode_choice == len(NODE_MODES):
+        return False
 
     if mode_choice == 0:
         state["rules"].pop(tag, None)
@@ -825,7 +817,8 @@ def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
         regex = prompt("名称正则（可留空，例如 香港|日本）: ")
         names = select_names(nodes, selectors, [regex] if regex else [])
         if mode_choice == 2 and not names:
-            raise CliError("“仅使用”模式至少需要选择一个节点")
+            print("“仅使用”模式至少要选一个节点，回到模式选择。")
+            return False
         rule = {"mode": "exclude" if mode_choice == 1 else "only", "names": names}
         state["rules"][tag] = rule
     else:
@@ -836,14 +829,37 @@ def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
     print(f"\n目标文件: {DEFAULT_OUTPUT}")
     print(f"分组名称: {DEFAULT_GROUP}")
     if not prompt_yes_no("写入配置吗？"):
-        print("未写入配置。")
-        return
+        print("未写入配置，回到模式选择。")
+        return False
 
     args.group = DEFAULT_GROUP
     args.output = DEFAULT_OUTPUT
     args.policy = "min_moving_avg"
     args.reload, args.restart = choose_apply_mode()
     command_apply(args, state)
+    return True
+
+
+def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    subscriptions = {
+        tag: item for tag, item in read_subscriptions(Path(args.config)).items() if item["tagged"]
+    }
+    if not subscriptions:
+        raise CliError("配置中没有带标签的订阅")
+    tags = list(subscriptions)
+    given = getattr(args, "tag", None)
+    fixed = given if given in subscriptions else None
+    while True:
+        if fixed:
+            tag = fixed
+        else:
+            choice = pick("dae 订阅节点管理 — 选择订阅", tags + [BACK])
+            if choice is None or choice == len(tags):
+                print("已返回。")
+                return
+            tag = tags[choice]
+        if _node_rule_step(args, state, tag) or fixed:
+            return
 
 
 # ------------------------------------------------------- subscription management
@@ -1118,7 +1134,7 @@ def command_sub_menu(args: argparse.Namespace, state: dict[str, Any]) -> None:
             cached = len(state.get("nodes", {}).get(tag, []))
             rows.append(f"{tag:<14} {cached or '-':>4} 节点   {mask_url(subscriptions[tag]['url'])}")
         rows += ["＋ 新增订阅", "⟳ 刷新节点数", "← 返回"]
-        choice = pick(f"订阅管理  ({entry})", rows, index=len(rows) - 1 if not tags else 0)
+        choice = pick(f"订阅管理  ({entry})", rows)
         if choice is None or choice == len(tags) + 2:
             return
         namespace = argparse.Namespace(**{**vars(args), "tag": None})
@@ -1140,7 +1156,7 @@ def command_sub_menu(args: argparse.Namespace, state: dict[str, Any]) -> None:
                     continue
                 if action == 0:
                     command_node_flow(argparse.Namespace(**{**vars(args), "tag": tag}), state)
-                    return
+                    continue
                 namespace.action = "remove"
                 namespace.tag = tag
                 command_sub(namespace, state)
@@ -1165,7 +1181,6 @@ def command_interactive(args: argparse.Namespace, state: dict[str, Any]) -> None
             command_sub_menu(args, state)
         elif choice == 1:
             command_node_flow(args, state)
-            return
         else:
             try:
                 command_edit(argparse.Namespace(**{**vars(args), "target": None}), state)
@@ -1292,9 +1307,10 @@ def command_edit(args: argparse.Namespace, state: dict[str, Any]) -> None:
             except OSError:
                 stamp = "?"
             rows.append(f"{path.name:<20} {describe_config(path):<26} {stamp}")
+        rows.append("← 返回")
         choice = pick(f"编辑配置文件  ({entry})", rows)
-        if choice is None:
-            print("已取消。")
+        if choice is None or choice == len(files):
+            print("已返回。")
             return
         target = files[choice]
 

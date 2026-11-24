@@ -210,6 +210,9 @@ dae-cli
 ```
 
 - `↑ ↓` / `j k` move, `Home` / `End` / `g` / `G` jump, `Enter` selects, `q` / `Esc` / `Ctrl-C` leaves;
+- **every list has a `← 返回` row at the bottom** and `q` / `Esc` is the same as picking it — you can
+  always climb back one level, and finishing an action (write / delete / apply) drops you back at
+  the list you came from instead of quitting the program;
 - the screen is redrawn in place (cursor home + per-line clear), so nothing scrolls away and the
   previous menu does not pile up in your scrollback;
 - subscription management is one flat list: pick a subscription, then
