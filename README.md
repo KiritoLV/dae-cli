@@ -46,10 +46,25 @@ as private. It lives in the *invoking user's* home even when the CLI runs under 
 ## Install
 
 ```console
-$ sudo ./install.sh          # installs the CLI, the wrapper and the sudoers rule
-$ ./install.sh --dry-run     # print every action, touch nothing (no root needed)
+$ sudo ./install.sh            # interactive menu: install / uninstall / status
+$ sudo ./install.sh --install  # same, non-interactive (scripts, Ansible, ...)
+$ ./install.sh --status        # what is installed right now (no root needed)
 $ sudo ./install.sh --uninstall
+$ ./install.sh --install --dry-run   # print every action, touch nothing
 ```
+
+Running it as root with no arguments gives:
+
+```
+    1) 安装      install    (root-owned wrapper + 受限 sudoers 规则)
+    2) 卸载      uninstall  (删入口 + 库 + sudoers，保留 dae 配置与 state)
+    3) 查看状态  status     (装了什么、md5 是否一致、免密是否生效)
+    q) 退出      quit
+```
+
+`--status` also compares the installed `dae_cli.py` with the one in the repo, so
+"did I actually reinstall after pulling?" is one command. Uninstalling never touches
+`/etc/dae/` or your cached node names.
 
 Then add the short command to your shell:
 
