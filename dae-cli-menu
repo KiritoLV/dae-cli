@@ -6,7 +6,8 @@
 #   2. 参数只接受位置参数，任何以 - 开头的选项默认拒绝
 #      —— 这样 --output / --state / --config / --dae-bin 这些能让我们用 root
 #      去改写任意文件的选项，永远进不来；
-#   3. 只额外放行两个无害选项：--reload（apply 后热加载 dae）、--cached（用缓存节点列表）；
+#   3. 只额外放行三个无害选项：--reload（热重载 dae）、--restart（重启 dae 服务，
+#      当前节点已坏时用，避免 reload 卡死）、--cached（用缓存节点列表）；
 #   4. 不带参数 = 原来的交互式菜单，行为完全不变。
 set -eu
 
@@ -26,9 +27,11 @@ usage() {
   exclude <订阅> 节点... [--cached] 排除选中的节点
   restore <订阅> 节点...            从当前规则里去掉这些节点
   reset <订阅>                     清空该订阅的规则
-  apply <订阅> [--reload]          重写 /etc/dae/config.d/50-group.dae
+  apply <订阅> [--reload|--restart]  重写 /etc/dae/config.d/50-group.dae
+                                    --reload  热重载（快，当前节点还能用时）
+                                    --restart 重启 dae 服务（当前节点已坏、reload 会卡死时）
 
-注意: 除 --reload / --cached 外，不接受任何选项参数。
+注意: 除 --reload / --restart / --cached 外，不接受任何选项参数。
 EOF
 }
 
@@ -53,8 +56,8 @@ esac
 
 for arg in "$@"; do
     case "$arg" in
-        --reload|--cached) ;;
-        -*) printf 'dae-cli: 不接受选项参数 %s（只允许 --reload / --cached）\n' "$arg" >&2; exit 2 ;;
+        --reload|--restart|--cached) ;;
+        -*) printf 'dae-cli: 不接受选项参数 %s（只允许 --reload / --restart / --cached）\n' "$arg" >&2; exit 2 ;;
     esac
 done
 

@@ -24,10 +24,13 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 MAX_SUBSCRIPTION_SIZE = 10 * 1024 * 1024
 DEFAULT_GROUP = "proxy"
 DEFAULT_OUTPUT = "/etc/dae/config.d/50-group.dae"
+DAE_SERVICE = "dae.service"
+DEFAULT_RELOAD_TIMEOUT = 20
+DEFAULT_RESTART_TIMEOUT = 90
 
 
 class CliError(Exception):
@@ -420,7 +423,50 @@ def atomic_write(path: Path, content: str) -> None:
             os.unlink(temp_name)
 
 
-def validate_and_reload(args: argparse.Namespace, reload_requested: bool) -> None:
+def reload_dae(args: argparse.Namespace) -> None:
+    """`dae reload` deadlocks when the node it is switching away from is already dead.
+
+    So it always runs under a timeout and says exactly what to do instead.
+    """
+    dae = shutil.which(args.dae_bin)
+    if not dae:
+        raise CliError(f"{args.dae_bin!r} not found")
+    timeout = getattr(args, "reload_timeout", None) or DEFAULT_RELOAD_TIMEOUT
+    try:
+        result = subprocess.run([dae, "reload"], text=True, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise CliError(
+            f"dae reload 超过 {timeout}s 没返回 —— 当前节点多半已经不可用，热重载卡住了。\n"
+            f"改用重启服务：sudo dm apply <订阅> --restart（等价 systemctl restart {DAE_SERVICE}）"
+        ) from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise CliError(f"dae reload failed:\n{detail}")
+    print("dae reloaded（热重载成功，没重启进程）")
+
+
+def restart_dae(args: argparse.Namespace) -> None:
+    """stop + start: cannot deadlock on a broken node, costs a few seconds offline."""
+    service = getattr(args, "service", None) or DAE_SERVICE
+    print(f"{service}: 重启中…")
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", service], text=True, capture_output=True, timeout=DEFAULT_RESTART_TIMEOUT
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise CliError(f"systemctl restart {service} 超时（{DEFAULT_RESTART_TIMEOUT}s）") from exc
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise CliError(f"systemctl restart {service} failed:\n{detail}")
+    state = subprocess.run(["systemctl", "is-active", service], text=True, capture_output=True).stdout.strip()
+    print(f"{service}: {state or 'unknown'}")
+    if state != "active":
+        raise CliError(f"{service} 重启后不是 active（{state}）—— 看 journalctl -u {service} -n 50")
+
+
+def validate_and_reload(
+    args: argparse.Namespace, reload_requested: bool = False, restart_requested: bool = False
+) -> None:
     dae = shutil.which(args.dae_bin)
     if not dae:
         print(f"warning: {args.dae_bin!r} not found; skipped validation", file=sys.stderr)
@@ -430,11 +476,19 @@ def validate_and_reload(args: argparse.Namespace, reload_requested: bool) -> Non
         detail = (result.stderr or result.stdout).strip()
         raise CliError(f"dae validation failed:\n{detail}")
     print("dae config validation: OK")
-    if reload_requested:
-        result = subprocess.run([dae, "reload"], text=True)
-        if result.returncode:
-            raise CliError("dae reload failed (try running with sudo)")
-        print("dae reloaded")
+
+    if restart_requested:
+        restart_dae(args)
+        return
+    if not reload_requested:
+        return
+    try:
+        reload_dae(args)
+    except CliError as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        if not sys.stdin.isatty() or not prompt_yes_no(f"现在改成重启 {DAE_SERVICE}（会断几秒）？", True):
+            raise
+        restart_dae(args)
 
 
 def command_subs(args: argparse.Namespace, state: dict[str, Any]) -> None:
@@ -507,6 +561,20 @@ def command_status(args: argparse.Namespace, state: dict[str, Any]) -> None:
         print(f"output: {profile['output']}")
 
 
+def choose_apply_mode() -> tuple[bool, bool]:
+    """(reload, restart) -- hot reload is fast, restart survives a dead current node."""
+    print("\ndae 怎么生效？")
+    print("   1) 热重载  dae reload        快、不重启进程 —— 当前节点还能用时选这个")
+    print("   2) 重启服务 restart dae      慢几秒，但当前节点已经坏了也不会卡死")
+    print("   0) 先不动                    我稍后自己处理")
+    choice = (prompt("选择 [1]: ") or "1").strip()
+    if choice == "2":
+        return False, True
+    if choice == "0":
+        return False, False
+    return True, False
+
+
 def command_apply(args: argparse.Namespace, state: dict[str, Any]) -> None:
     group = args.group or DEFAULT_GROUP
     output = Path(args.output or DEFAULT_OUTPUT)
@@ -530,7 +598,7 @@ def command_apply(args: argparse.Namespace, state: dict[str, Any]) -> None:
         )
     else:
         try:
-            validate_and_reload(args, args.reload)
+            validate_and_reload(args, getattr(args, "reload", False), getattr(args, "restart", False))
         except CliError:
             if previous is None:
                 output.unlink(missing_ok=True)
@@ -631,7 +699,7 @@ def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
     args.group = DEFAULT_GROUP
     args.output = DEFAULT_OUTPUT
     args.policy = "min_moving_avg"
-    args.reload = prompt_yes_no("写入后立即热加载 dae 吗？")
+    args.reload, args.restart = choose_apply_mode()
     command_apply(args, state)
 
 
@@ -802,7 +870,7 @@ def backup_and_write(path: Path, text: str) -> Path | None:
 
 def apply_config_change(args: argparse.Namespace, path: Path, backup: Path | None) -> None:
     try:
-        validate_and_reload(args, getattr(args, "reload", False))
+        validate_and_reload(args, getattr(args, "reload", False), getattr(args, "restart", False))
     except CliError:
         if backup is not None and backup.exists():
             shutil.copy2(backup, path)
@@ -1090,7 +1158,7 @@ def command_edit(args: argparse.Namespace, state: dict[str, Any]) -> None:
     print(f"改动：+{plus} / -{minus} 行（备份 {backup.name if backup else '无'}）")
 
     try:
-        validate_and_reload(args, getattr(args, "reload", False))
+        validate_and_reload(args, getattr(args, "reload", False), getattr(args, "restart", False))
     except CliError:
         if backup is not None and prompt_yes_no("校验没通过，要回滚到编辑前的内容吗？", True):
             shutil.copy2(backup, target)
@@ -1145,18 +1213,21 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--group", help=f"managed group name (default: {DEFAULT_GROUP})")
     apply.add_argument("--output", help="generated config file")
     apply.add_argument("--policy", help="dae group policy")
-    apply.add_argument("--reload", action="store_true", help="reload dae after validation")
+    apply.add_argument("--reload", action="store_true", help="hot reload dae after validation (fast)")
+    apply.add_argument("--restart", action="store_true", help="restart the dae service (safe when the current node is dead)")
     apply.set_defaults(func=command_apply)
 
     manage = sub.add_parser("sub", help="list / add / remove subscriptions in the dae config")
     manage.add_argument("action", nargs="?", choices=["list", "add", "remove"], default="menu")
     manage.add_argument("tag", nargs="?", help="subscription tag (prompted when omitted)")
-    manage.add_argument("--reload", action="store_true", help="reload dae after the change")
+    manage.add_argument("--reload", action="store_true", help="hot reload dae after the change")
+    manage.add_argument("--restart", action="store_true", help="restart the dae service instead of reloading")
     manage.set_defaults(func=command_sub)
 
     editor = sub.add_parser("edit", help="open one of the dae config files in your editor")
     editor.add_argument("target", nargs="?", help="file name or a part of it (global / dns / routing …)")
-    editor.add_argument("--reload", action="store_true", help="reload dae after editing")
+    editor.add_argument("--reload", action="store_true", help="hot reload dae after editing")
+    editor.add_argument("--restart", action="store_true", help="restart the dae service instead of reloading")
     editor.set_defaults(func=command_edit)
 
     return parser

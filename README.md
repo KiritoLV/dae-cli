@@ -95,7 +95,7 @@ $ sudo python3 dae_cli.py subs
 | `restore <sub> <sel>...` | remove these names from the current rule |
 | `reset <sub>` | back to all nodes |
 | `status <sub>` | show the current rule |
-| `apply <sub> [--reload]` | write the group file; `--reload` restarts dae |
+| `apply <sub> [--reload\|--restart]` | write the group file; `--reload` = hot reload, `--restart` = restart the service |
 | `sub [list\|add\|remove] [tag]` | manage the subscriptions themselves (see below) |
 | `edit [name] [--reload]` | open global / dns / routing … in `$EDITOR`, validate on exit |
 
@@ -231,6 +231,31 @@ Design notes:
   `config.d/20-subscription.dae` when there is none);
 - `remove` drops just that one line, and the block itself once it is empty; the cached
   node list and node rule for that tag are cleared too.
+
+## Reload vs restart (why `dae reload` hangs)
+
+`dae reload` re-reads the config and re-dials connections **inside the running process**. That
+is fast and seamless as long as the node you are currently on still works. When you are
+switching *because the current node is dead*, reload tries to tear down a connection that will
+never come back and can block indefinitely — the switch looks like a hang and never lands.
+
+So there are two ways to make a change take effect:
+
+| | command | cost | when |
+|---|---|---|---|
+| hot reload | `sudo dm apply <tag> --reload` (menu default) | ~instant, no restart, no dropped connections | current node is healthy |
+| restart service | `sudo dm apply <tag> --restart` | a few seconds offline, connections drop | current node is already dead, or reload hung last time |
+
+Details:
+
+- `dae reload` runs under a **20 s timeout** (`DEFAULT_RELOAD_TIMEOUT`). On timeout you get
+  `当前节点多半已经不可用，热重载卡住了` plus the `--restart` hint instead of a frozen terminal;
+- when a reload you asked for interactively times out, you are offered the restart right away;
+  non-interactive runs fail with that message and a non-zero exit;
+- `--restart` = `systemctl restart dae.service`, then `systemctl is-active` is checked and a
+  non-`active` result is reported together with `journalctl -u dae.service -n 50`;
+- the interactive menu asks every time it writes: `1) 热重载  2) 重启服务  0) 先不动`;
+- `dm sub add|remove` and `dm edit` accept `--restart` as well.
 
 ## Editing the config files from the CLI
 

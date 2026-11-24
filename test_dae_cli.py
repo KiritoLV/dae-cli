@@ -1,6 +1,7 @@
 import argparse
 import base64
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -73,7 +74,7 @@ class DaeCliTests(unittest.TestCase):
                 state=str(root / "state.json"),
                 dae_bin="dae",
             )
-            answers = iter(["2", "1", "2", "1", "", "y", "n"])
+            answers = iter(["2", "1", "2", "1", "", "y", "0"])
             with mock.patch("builtins.input", side_effect=lambda _: next(answers)):
                 with mock.patch("dae_cli.command_apply") as apply:
                     state = dae_cli.empty_state()
@@ -251,6 +252,41 @@ class ConfigEditTests(unittest.TestCase):
             with mock.patch("dae_cli.shutil.which", return_value=None):
                 with self.assertRaises(dae_cli.CliError):
                     dae_cli.pick_editor()
+
+
+class ApplyModeTests(unittest.TestCase):
+    """热重载 vs 重启服务：两条路都要能选到。"""
+
+    def test_default_is_hot_reload(self):
+        with mock.patch("builtins.input", side_effect=lambda _: ""):
+            self.assertEqual(dae_cli.choose_apply_mode(), (True, False))
+
+    def test_restart_mode(self):
+        with mock.patch("builtins.input", side_effect=lambda _: "2"):
+            self.assertEqual(dae_cli.choose_apply_mode(), (False, True))
+
+    def test_skip(self):
+        with mock.patch("builtins.input", side_effect=lambda _: "0"):
+            self.assertEqual(dae_cli.choose_apply_mode(), (False, False))
+
+    def test_reload_timeout_is_reported_as_dead_node(self):
+        args = argparse.Namespace(dae_bin="dae", reload_timeout=1)
+        with mock.patch("dae_cli.shutil.which", return_value="/usr/bin/dae"):
+            with mock.patch("dae_cli.subprocess.run",
+                            side_effect=subprocess.TimeoutExpired(cmd="dae reload", timeout=1)):
+                with self.assertRaises(dae_cli.CliError) as ctx:
+                    dae_cli.reload_dae(args)
+        self.assertIn("--restart", str(ctx.exception))
+
+    def test_restart_checks_is_active(self):
+        args = argparse.Namespace()
+        done = subprocess.CompletedProcess(args=[], returncode=0, stdout="active\n", stderr="")
+        with mock.patch("dae_cli.subprocess.run", return_value=done):
+            dae_cli.restart_dae(args)
+        failed = subprocess.CompletedProcess(args=[], returncode=0, stdout="failed\n", stderr="")
+        with mock.patch("dae_cli.subprocess.run", return_value=failed):
+            with self.assertRaises(dae_cli.CliError):
+                dae_cli.restart_dae(args)
 
 
 if __name__ == "__main__":
