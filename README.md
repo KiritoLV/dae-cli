@@ -195,6 +195,30 @@ Single-file setups (everything in one `config.dae`) are **not** a tested path �
 most likely still work because the reader follows the entry file, but keep it in mind if
 something looks off.
 
+## Full-screen menu
+
+`dm` with no arguments opens a full-screen, arrow-key menu (stdlib only, no curses, no deps):
+
+```
+dae-cli
+──────────────────────────────────────────────
+  订阅管理（列表 / 新增 / 删除）
+  节点规则（选择哪些节点进代理组）
+  编辑配置文件（global / dns / routing …）
+  退出
+↑↓ / j k 选择    Enter 确认    q 退出
+```
+
+- `↑ ↓` / `j k` move, `Home` / `End` / `g` / `G` jump, `Enter` selects, `q` / `Esc` / `Ctrl-C` leaves;
+- the screen is redrawn in place (cursor home + per-line clear), so nothing scrolls away and the
+  previous menu does not pile up in your scrollback;
+- subscription management is one flat list: pick a subscription, then
+  `用它写进 50-group（选节点）` / `删除这条订阅`; `＋ 新增订阅` and `⟳ 刷新节点数` sit at the bottom;
+- **no TTY (pipe, script, `dm | tee`) falls back to the numbered prompts automatically** —
+  force it anywhere with `DAE_CLI_PLAIN=1`;
+- the node-selection wizard (node numbers, ranges, regex) stays line-based on purpose: it needs
+  free-text input, not a list.
+
 ## Managing subscriptions
 
 `dm` with no arguments now opens a two-level menu; subscription management is the first entry:

@@ -12,19 +12,22 @@ import json
 import os
 import pwd
 import re
+import select
 import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+import termios
 import time
+import tty
 import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 MAX_SUBSCRIPTION_SIZE = 10 * 1024 * 1024
 DEFAULT_GROUP = "proxy"
 DEFAULT_OUTPUT = "/etc/dae/config.d/50-group.dae"
@@ -639,6 +642,139 @@ def prompt_yes_no(prompt_text: str, default: bool = True) -> bool:
         print("请输入 y 或 n。")
 
 
+# ---------------------------------------------------------------- full-screen picker
+
+KEY_SEQUENCES = {
+    b"[A": "up",
+    b"[B": "down",
+    b"[H": "home",
+    b"[F": "end",
+    b"[1~": "home",
+    b"[4~": "end",
+    b"OA": "up",
+    b"OB": "down",
+    b"OH": "home",
+    b"OF": "end",
+}
+TUI_HINT = "↑↓ / j k 选择    Enter 确认    q 退出"
+
+
+def tui_available() -> bool:
+    """Full-screen UI only on a real terminal; pipes and tests fall back to numbers."""
+    if os.environ.get("DAE_CLI_PLAIN"):
+        return False
+    return sys.stdin.isatty() and sys.stdout.isatty() and os.environ.get("TERM", "dumb") != "dumb"
+
+
+def clip(text: str, width: int) -> str:
+    if width <= 1:
+        return text
+    if len(text) <= width - 1:
+        return text
+    return text[: width - 2] + "…"
+
+
+def read_key(fd: int = 0) -> str:
+    try:
+        char = os.read(fd, 1)
+    except OSError:
+        return "quit"
+    if not char or char == b"\x03":
+        return "quit"
+    if char == b"\x1b":
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready:
+            return "esc"
+        seq = os.read(fd, 1)
+        if seq in (b"[", b"O"):
+            ready, _, _ = select.select([fd], [], [], 0.05)
+            if not ready:
+                return "other"
+            seq += os.read(fd, 1)
+            if seq[1:2].isdigit():
+                ready, _, _ = select.select([fd], [], [], 0.05)
+                if ready:
+                    seq += os.read(fd, 1)
+        return KEY_SEQUENCES.get(seq, "other")
+    if char in (b"\r", b"\n", b" "):
+        return "enter"
+    if char in (b"q", b"Q"):
+        return "quit"
+    if char in (b"j", b"J"):
+        return "down"
+    if char in (b"k", b"K"):
+        return "up"
+    if char == b"g":
+        return "home"
+    if char == b"G":
+        return "end"
+    return "other"
+
+
+def draw_screen(title: str, items: list[str], index: int, hint: str) -> None:
+    width, height = shutil.get_terminal_size((80, 24))
+    rows = max(3, height - 4)
+    start = 0
+    if len(items) > rows:
+        start = min(max(0, index - rows // 2), len(items) - rows)
+    out = [f"\x1b[H\x1b[2K\x1b[1m{clip(title, width)}\x1b[0m", "\x1b[2K" + "─" * min(width, 64)]
+    for offset, text in enumerate(items[start : start + rows]):
+        line = clip(f"  {text}", width)
+        if start + offset == index:
+            out.append("\x1b[2K\x1b[7m" + line.ljust(min(width, 64)) + "\x1b[0m")
+        else:
+            out.append("\x1b[2K" + line)
+    out.append("\x1b[2K" + clip(hint, width))
+    out.append("\x1b[J")
+    sys.stdout.write("\r\n".join(out))
+    sys.stdout.flush()
+
+
+def pick_numbered(title: str, items: list[str], hint: str = "") -> int | None:
+    """The old line-by-line menu，used when there is no terminal."""
+    print(f"\n{title}")
+    for number, text in enumerate(items, 1):
+        print(f"   {number}) {text}")
+    if hint:
+        print(f"   {hint}")
+    answer = (prompt("选择（0 取消）[0]: ") or "0").strip()
+    if not answer.isdigit() or not 1 <= int(answer) <= len(items):
+        return None
+    return int(answer) - 1
+
+
+def pick(title: str, items: list[str], hint: str = TUI_HINT, index: int = 0) -> int | None:
+    """Arrow-key menu: returns the chosen index, or None on q / Esc."""
+    if not items:
+        return None
+    if not tui_available():
+        return pick_numbered(title, items, hint if hint != TUI_HINT else "")
+    fd = sys.stdin.fileno()
+    saved = termios.tcgetattr(fd)
+    index = max(0, min(index, len(items) - 1))
+    try:
+        tty.setraw(fd)
+        sys.stdout.write("\x1b[?25l")
+        while True:
+            draw_screen(title, items, index, hint)
+            key = read_key(fd)
+            if key in ("quit", "esc"):
+                return None
+            if key == "enter":
+                return index
+            if key == "up":
+                index = (index - 1) % len(items)
+            elif key == "down":
+                index = (index + 1) % len(items)
+            elif key == "home":
+                index = 0
+            elif key == "end":
+                index = len(items) - 1
+    finally:
+        sys.stdout.write("\x1b[?25h\x1b[H\x1b[J")
+        sys.stdout.flush()
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
 def print_node_selection(nodes: list[str], rule: dict[str, Any]) -> None:
     mode = rule.get("mode", "all")
     selected = set(rule.get("names", []))
@@ -655,21 +791,28 @@ def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
     if not subscriptions:
         raise CliError("配置中没有带标签的订阅")
 
-    print("\ndae 订阅节点管理\n")
     tags = list(subscriptions)
-    for index, tag in enumerate(tags, 1):
-        print(f"{index:3d}. {tag}")
-    tag = tags[prompt_index("\n选择订阅编号: ", len(tags))]
+    given = getattr(args, "tag", None)
+    if given in subscriptions:
+        tag = given
+    else:
+        choice = pick("dae 订阅节点管理 — 选择订阅", tags)
+        if choice is None:
+            print("已取消。")
+            return
+        tag = tags[choice]
     args.tag = tag
     print(f"\n正在获取 {tag} 的节点...")
     nodes = get_nodes(args, state, refresh=True)
     print(f"获取到 {len(nodes)} 个节点。\n")
 
-    print("1. 使用全部节点")
-    print("2. 排除部分节点")
-    print("3. 仅使用选中的节点")
-    print("4. 保持当前规则")
-    mode_choice = prompt_index("\n选择模式: ", 4)
+    mode_choice = pick(
+        f"{tag} — 规则模式",
+        ["使用全部节点", "排除部分节点", "仅使用选中的节点", "保持当前规则"],
+    )
+    if mode_choice is None:
+        print("已取消。")
+        return
 
     if mode_choice == 0:
         state["rules"].pop(tag, None)
@@ -968,50 +1111,66 @@ def command_sub(args: argparse.Namespace, state: dict[str, Any]) -> None:
 def command_sub_menu(args: argparse.Namespace, state: dict[str, Any]) -> None:
     entry = Path(args.config)
     while True:
-        print("\n=== 订阅管理 ===")
-        print_subscription_table(entry, state)
-        print("\n  1) 新增订阅   2) 删除订阅   3) 刷新节点数   0) 返回")
-        choice = prompt("选择 [0]: ") or "0"
-        if choice == "0":
+        subscriptions = read_subscriptions(entry)
+        tags = list(subscriptions)
+        rows = []
+        for tag in tags:
+            cached = len(state.get("nodes", {}).get(tag, []))
+            rows.append(f"{tag:<14} {cached or '-':>4} 节点   {mask_url(subscriptions[tag]['url'])}")
+        rows += ["＋ 新增订阅", "⟳ 刷新节点数", "← 返回"]
+        choice = pick(f"订阅管理  ({entry})", rows, index=len(rows) - 1 if not tags else 0)
+        if choice is None or choice == len(tags) + 2:
             return
         namespace = argparse.Namespace(**{**vars(args), "tag": None})
         try:
-            if choice == "1":
+            if choice == len(tags):
                 namespace.action = "add"
                 command_sub(namespace, state)
-            elif choice == "2":
-                namespace.action = "remove"
-                command_sub(namespace, state)
-            elif choice == "3":
+            elif choice == len(tags) + 1:
                 refresh_all_counts(args, state)
+            elif choice == len(tags) + 2:
+                return
             else:
-                print("无效选项。")
+                tag = tags[choice]
+                action = pick(
+                    f"{tag}  {mask_url(subscriptions[tag]['url'])}",
+                    ["用它写进 50-group（选节点）", "删除这条订阅", "返回"],
+                )
+                if action is None or action == 2:
+                    continue
+                if action == 0:
+                    command_node_flow(argparse.Namespace(**{**vars(args), "tag": tag}), state)
+                    return
+                namespace.action = "remove"
+                namespace.tag = tag
+                command_sub(namespace, state)
         except (CliError, OSError) as exc:
             print(f"error: {exc}", file=sys.stderr)
 
 
 def command_interactive(args: argparse.Namespace, state: dict[str, Any]) -> None:
     while True:
-        print("\n=== dae-cli ===")
-        print("  1) 订阅管理（列表 / 新增 / 删除）")
-        print("  2) 节点规则（选择哪些节点进代理组）")
-        print("  3) 编辑配置文件（global / dns / routing …）")
-        print("  0) 退出")
-        choice = prompt("选择 [0]: ") or "0"
-        if choice == "0":
+        choice = pick(
+            "dae-cli",
+            [
+                "订阅管理（列表 / 新增 / 删除）",
+                "节点规则（选择哪些节点进代理组）",
+                "编辑配置文件（global / dns / routing …）",
+                "退出",
+            ],
+        )
+        if choice is None or choice == 3:
             return
-        if choice == "1":
+        if choice == 0:
             command_sub_menu(args, state)
-        elif choice == "2":
+        elif choice == 1:
             command_node_flow(args, state)
             return
-        elif choice == "3":
+        else:
             try:
                 command_edit(argparse.Namespace(**{**vars(args), "target": None}), state)
             except (CliError, OSError) as exc:
                 print(f"error: {exc}", file=sys.stderr)
-        else:
-            print("无效选项。")
 
 
 # --------------------------------------------------------------- config editing
@@ -1126,18 +1285,18 @@ def command_edit(args: argparse.Namespace, state: dict[str, Any]) -> None:
             raise CliError(f"'{wanted}' 匹配到多个文件：{', '.join(item.name for item in matches)}")
         target = matches[0]
     else:
-        print("\n=== 编辑配置文件 ===")
-        for index, path in enumerate(files, 1):
+        rows = []
+        for path in files:
             try:
                 stamp = time.strftime("%m-%d %H:%M", time.localtime(path.stat().st_mtime))
             except OSError:
                 stamp = "?"
-            print(f"   {index}) {path.name:<20} {describe_config(path):<26} {stamp}")
-        answer = (prompt(f"\n选择 1-{len(files)}（0 取消）[0]: ") or "0").strip()
-        if not answer.isdigit() or not 1 <= int(answer) <= len(files):
+            rows.append(f"{path.name:<20} {describe_config(path):<26} {stamp}")
+        choice = pick(f"编辑配置文件  ({entry})", rows)
+        if choice is None:
             print("已取消。")
             return
-        target = files[int(answer) - 1]
+        target = files[choice]
 
     before = target.read_text(encoding="utf-8", errors="replace")
     backup = backup_and_write(target, before)
