@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+# per-user state (subscription labels, node names, expiry dates)
+state.json

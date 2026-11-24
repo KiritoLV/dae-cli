@@ -1,0 +1,59 @@
+#!/bin/sh
+# dae-cli root entry point（dm / sudo 免密入口）
+#
+# 设计原则：
+#   1. 子命令走白名单，其它一律拒绝；
+#   2. 参数只接受位置参数，任何以 - 开头的选项默认拒绝
+#      —— 这样 --output / --state / --config / --dae-bin 这些能让我们用 root
+#      去改写任意文件的选项，永远进不来；
+#   3. 只额外放行两个无害选项：--reload（apply 后热加载 dae）、--cached（用缓存节点列表）；
+#   4. 不带参数 = 原来的交互式菜单，行为完全不变。
+set -eu
+
+CLI=/usr/local/libexec/dae-cli/dae_cli.py
+
+usage() {
+    cat <<'EOF'
+用法: dm [子命令] [参数...]
+
+  不带参数                         交互式菜单（原行为）
+  subs                             列出订阅标签
+  status <订阅>                    看某个订阅当前的规则
+  nodes <订阅> [--cached]          列出该订阅的节点
+  only <订阅> 节点... [--cached]    只使用选中的节点（编号/范围/精确名）
+  exclude <订阅> 节点... [--cached] 排除选中的节点
+  restore <订阅> 节点...            从当前规则里去掉这些节点
+  reset <订阅>                     清空该订阅的规则
+  apply <订阅> [--reload]          重写 /etc/dae/config.d/50-group.dae
+
+注意: 除 --reload / --cached 外，不接受任何选项参数。
+EOF
+}
+
+if [ "$#" -eq 0 ]; then
+    exec /usr/bin/python3 -I "$CLI"
+fi
+
+case "$1" in
+    interactive|i|subs|subscriptions|nodes|only|exclude|restore|reset|status|apply)
+        sub=$1
+        shift
+        ;;
+    -h|--help|help)
+        usage
+        exit 0
+        ;;
+    *)
+        printf 'dae-cli: 不支持的子命令 %s（dm help 看用法）\n' "$1" >&2
+        exit 2
+        ;;
+esac
+
+for arg in "$@"; do
+    case "$arg" in
+        --reload|--cached) ;;
+        -*) printf 'dae-cli: 不接受选项参数 %s（只允许 --reload / --cached）\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+
+exec /usr/bin/python3 -I "$CLI" "$sub" "$@"

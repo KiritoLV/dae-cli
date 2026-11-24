@@ -1,0 +1,703 @@
+#!/usr/bin/env python3
+"""Small, dependency-free subscription and node filter manager for dae."""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import base64
+import glob
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+VERSION = "0.2.0"
+MAX_SUBSCRIPTION_SIZE = 10 * 1024 * 1024
+DEFAULT_GROUP = "proxy"
+DEFAULT_OUTPUT = "/etc/dae/config.d/50-group.dae"
+
+
+class CliError(Exception):
+    pass
+
+
+def real_user_home() -> Path:
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            return Path(pwd.getpwnam(sudo_user).pw_dir)
+        except KeyError:
+            pass
+    return Path.home()
+
+
+def default_state_path() -> Path:
+    config_home = os.environ.get("XDG_CONFIG_HOME")
+    if config_home and not os.environ.get("SUDO_USER"):
+        return Path(config_home) / "dae-cli" / "state.json"
+    return real_user_home() / ".config" / "dae-cli" / "state.json"
+
+
+def strip_comments(text: str) -> str:
+    out: list[str] = []
+    quote: str | None = None
+    comment = False
+    escaped = False
+    for char in text:
+        if comment:
+            if char == "\n":
+                comment = False
+                out.append(char)
+            else:
+                out.append(" ")
+            continue
+        if escaped:
+            out.append(char)
+            escaped = False
+            continue
+        if quote and char == "\\":
+            out.append(char)
+            escaped = True
+        elif quote:
+            out.append(char)
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+            out.append(char)
+        elif char == "#":
+            comment = True
+            out.append(" ")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+def find_blocks(text: str, name: str) -> list[str]:
+    clean = strip_comments(text)
+    pattern = re.compile(r"(?<![\w.-])" + re.escape(name) + r"\s*\{")
+    blocks: list[str] = []
+    for match in pattern.finditer(clean):
+        start = match.end()
+        depth = 1
+        quote: str | None = None
+        escaped = False
+        for pos in range(start, len(clean)):
+            char = clean[pos]
+            if escaped:
+                escaped = False
+            elif quote and char == "\\":
+                escaped = True
+            elif quote:
+                if char == quote:
+                    quote = None
+            elif char in "'\"":
+                quote = char
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    blocks.append(clean[start:pos])
+                    break
+    return blocks
+
+
+def unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] in "'\"" and value[-1] == value[0]:
+        try:
+            return ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            return value[1:-1]
+    return value
+
+
+def config_files(entry: Path) -> list[Path]:
+    entry = entry.expanduser().resolve()
+    try:
+        entry.stat()
+    except PermissionError as exc:
+        raise CliError(f"cannot read dae config {entry}; run the command with sudo") from exc
+    except FileNotFoundError as exc:
+        raise CliError(f"dae config not found: {entry}") from exc
+    if not entry.is_file():
+        raise CliError(f"dae config not found: {entry}")
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    def visit(path: Path) -> None:
+        path = path.resolve()
+        if path in seen:
+            return
+        seen.add(path)
+        found.append(path)
+        text = path.read_text(encoding="utf-8")
+        for block in find_blocks(text, "include"):
+            for raw in block.splitlines():
+                pattern = unquote(raw.strip())
+                if not pattern:
+                    continue
+                full_pattern = pattern if os.path.isabs(pattern) else str(entry.parent / pattern)
+                for child in sorted(glob.glob(full_pattern)):
+                    child_path = Path(child)
+                    if child_path.is_file():
+                        visit(child_path)
+
+    visit(entry)
+    return found
+
+
+ITEM_RE = re.compile(
+    r"^\s*(?:(?P<tag>\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*'|[\w.-]+)\s*:\s*)?"
+    r"(?P<url>\"(?:\\.|[^\"])*\"|'(?:\\.|[^'])*')\s*$"
+)
+
+
+def read_subscriptions(entry: Path) -> dict[str, dict[str, str]]:
+    subscriptions: dict[str, dict[str, str]] = {}
+    untagged = 0
+    for path in config_files(entry):
+        text = path.read_text(encoding="utf-8")
+        for block in find_blocks(text, "subscription"):
+            for line in block.splitlines():
+                match = ITEM_RE.match(line)
+                if not match:
+                    continue
+                tag_raw = match.group("tag")
+                if tag_raw:
+                    tag = unquote(tag_raw)
+                else:
+                    untagged += 1
+                    tag = f"<untagged:{untagged}>"
+                subscriptions[tag] = {
+                    "url": unquote(match.group("url")),
+                    "file": str(path),
+                    "tagged": bool(tag_raw),
+                }
+    return subscriptions
+
+
+def b64decode_loose(value: str | bytes) -> bytes:
+    raw = value.encode() if isinstance(value, str) else value
+    raw = re.sub(rb"\s+", b"", raw)
+    raw += b"=" * (-len(raw) % 4)
+    try:
+        return base64.urlsafe_b64decode(raw)
+    except (ValueError, base64.binascii.Error) as exc:
+        raise CliError("invalid Base64 subscription data") from exc
+
+
+def fetch_subscription(item: dict[str, str], entry: Path) -> bytes:
+    url = item["url"]
+    if url.startswith("https-file://"):
+        url = "https://" + url[len("https-file://") :]
+    elif url.startswith("http-file://"):
+        url = "http://" + url[len("http-file://") :]
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "file":
+        if not parsed.netloc:
+            raise CliError("dae file subscriptions must be relative, for example file://subs/nodes.txt")
+        relative = Path(urllib.parse.unquote(parsed.netloc)) / urllib.parse.unquote(parsed.path).lstrip("/")
+        path = entry.parent / relative
+        data = path.read_bytes()
+    elif parsed.scheme in {"http", "https"}:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "dae-cli/0.1 (like dae/1.0; like v2rayN/1.0)"},
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                data = response.read(MAX_SUBSCRIPTION_SIZE + 1)
+        except OSError as exc:
+            raise CliError(f"failed to fetch subscription: {exc}") from exc
+    else:
+        raise CliError(f"unsupported subscription scheme: {parsed.scheme or '<empty>'}")
+    if len(data) > MAX_SUBSCRIPTION_SIZE:
+        raise CliError("subscription exceeds 10 MiB")
+    return data.strip()
+
+
+def json_name(data: Any, fallback: str) -> str:
+    if isinstance(data, dict):
+        for key in ("ps", "remarks", "name", "tag", "server"):
+            value = data.get(key)
+            if value:
+                return str(value)
+    return fallback
+
+
+def node_name(link: str, number: int) -> str:
+    fallback = f"unnamed-{number}"
+    if link.startswith("vmess://"):
+        payload = link[len("vmess://") :].split("#", 1)[0]
+        try:
+            return json_name(json.loads(b64decode_loose(payload)), fallback)
+        except (CliError, json.JSONDecodeError, UnicodeDecodeError):
+            pass
+    if link.startswith("ssr://"):
+        try:
+            decoded = b64decode_loose(link[len("ssr://") :]).decode("utf-8")
+            query = decoded.split("/?", 1)[1] if "/?" in decoded else ""
+            remarks = urllib.parse.parse_qs(query).get("remarks", [""])[0]
+            if remarks:
+                return b64decode_loose(remarks).decode("utf-8")
+        except (CliError, UnicodeDecodeError, IndexError):
+            pass
+    if "#" in link:
+        name = urllib.parse.unquote(link.rsplit("#", 1)[1]).strip()
+        if name:
+            return name
+    try:
+        parsed = urllib.parse.urlsplit(link)
+        return parsed.hostname or fallback
+    except ValueError:
+        return fallback
+
+
+def parse_nodes(data: bytes) -> list[str]:
+    try:
+        document = json.loads(data)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        document = None
+    if isinstance(document, dict) and isinstance(document.get("servers"), list):
+        return [json_name(server, f"unnamed-{i}") for i, server in enumerate(document["servers"], 1)]
+
+    text = data.decode("utf-8", errors="replace").strip()
+    if "://" not in text:
+        try:
+            decoded = b64decode_loose(data).decode("utf-8")
+            if "://" in decoded:
+                text = decoded
+        except (CliError, UnicodeDecodeError):
+            pass
+    links = [line.strip() for line in text.splitlines() if "://" in line]
+    if not links:
+        if "proxies:" in text:
+            raise CliError("this looks like a Clash YAML subscription; use a URI/Base64 or SIP008 endpoint")
+        raise CliError("no supported node links found in subscription")
+    return [node_name(link, i) for i, link in enumerate(links, 1)]
+
+
+def empty_state() -> dict[str, Any]:
+    return {"version": 1, "nodes": {}, "rules": {}, "profiles": {}}
+
+
+def load_state(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return empty_state()
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise CliError(f"cannot read state file {path}: {exc}") from exc
+    base = empty_state()
+    base.update(state)
+    return base
+
+
+def save_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if os.environ.get("SUDO_UID") and os.environ.get("SUDO_GID"):
+        os.chown(path.parent, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+        if os.environ.get("SUDO_UID") and os.environ.get("SUDO_GID"):
+            os.chown(path, int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"]))
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def get_nodes(args: argparse.Namespace, state: dict[str, Any], refresh: bool = True) -> list[str]:
+    if not refresh and args.tag in state["nodes"]:
+        return list(state["nodes"][args.tag])
+    subscriptions = read_subscriptions(Path(args.config))
+    item = subscriptions.get(args.tag)
+    if not item:
+        raise CliError(f"tagged subscription not found: {args.tag}")
+    if not item["tagged"]:
+        raise CliError("untagged subscriptions cannot be selected with subtag(); add a tag in dae config")
+    nodes = parse_nodes(fetch_subscription(item, Path(args.config).resolve()))
+    state["nodes"][args.tag] = nodes
+    save_state(Path(args.state), state)
+    return nodes
+
+
+def select_names(nodes: list[str], selectors: list[str], matches: list[str]) -> list[str]:
+    selected: list[str] = []
+    for pattern in matches:
+        try:
+            regex = re.compile(pattern, re.IGNORECASE)
+        except re.error as exc:
+            raise CliError(f"invalid regex {pattern!r}: {exc}") from exc
+        selected.extend(name for name in nodes if regex.search(name))
+    for selector in selectors:
+        if selector in nodes:
+            selected.append(selector)
+            continue
+        range_match = re.fullmatch(r"(\d+)-(\d+)", selector)
+        indexes: list[int]
+        if range_match:
+            start, end = map(int, range_match.groups())
+            indexes = list(range(start, end + 1))
+        elif selector.isdigit():
+            indexes = [int(selector)]
+        else:
+            raise CliError(f"node not found: {selector!r} (use an exact name, number, range, or --match)")
+        for index in indexes:
+            if not 1 <= index <= len(nodes):
+                raise CliError(f"node number out of range: {index}")
+            selected.append(nodes[index - 1])
+    return list(dict.fromkeys(selected))
+
+
+def dae_quote(value: str) -> str:
+    return json.dumps(value, ensure_ascii=False)
+
+
+def render_filter(tag: str, rule: dict[str, Any]) -> str:
+    base = f"subtag({dae_quote(tag)})"
+    names = list(rule.get("names", []))
+    if not names:
+        return base
+    params = ", ".join(dae_quote(name) for name in names)
+    selected = f"name({params})"
+    return f"{base} && {selected}" if rule.get("mode") == "only" else f"{base} && !{selected}"
+
+
+def generated_config(tag: str, group: str, policy: str, rule: dict[str, Any]) -> str:
+    return (
+        "# Generated by dae-cli. Manual changes will be overwritten.\n"
+        "group {\n"
+        f"    {group} {{\n"
+        f"        filter: {render_filter(tag, rule)}\n"
+        f"        policy: {policy}\n"
+        "    }\n"
+        "}\n"
+    )
+
+
+def existing_groups(entry: Path, exclude: Path | None = None) -> set[str]:
+    groups: set[str] = set()
+    for path in config_files(entry):
+        if exclude and path.resolve() == exclude.resolve():
+            continue
+        for body in find_blocks(path.read_text(encoding="utf-8"), "group"):
+            groups.update(re.findall(r"(?m)^\s*([\w.-]+)\s*\{", body))
+    return groups
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    except PermissionError as exc:
+        raise CliError(f"cannot write {path}; run this command with sudo") from exc
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+
+def validate_and_reload(args: argparse.Namespace, reload_requested: bool) -> None:
+    dae = shutil.which(args.dae_bin)
+    if not dae:
+        print(f"warning: {args.dae_bin!r} not found; skipped validation", file=sys.stderr)
+        return
+    result = subprocess.run([dae, "validate", "-c", args.config], text=True, capture_output=True)
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise CliError(f"dae validation failed:\n{detail}")
+    print("dae config validation: OK")
+    if reload_requested:
+        result = subprocess.run([dae, "reload"], text=True)
+        if result.returncode:
+            raise CliError("dae reload failed (try running with sudo)")
+        print("dae reloaded")
+
+
+def command_subs(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    del state
+    subscriptions = read_subscriptions(Path(args.config))
+    if not subscriptions:
+        print("No subscriptions found.")
+        return
+    for tag, item in subscriptions.items():
+        suffix = "" if item["tagged"] else " (untagged; cannot filter)"
+        print(f"{tag}{suffix}\t{item['file']}")
+
+
+def command_nodes(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    nodes = get_nodes(args, state, refresh=not args.cached)
+    counts: dict[str, int] = {}
+    for name in nodes:
+        counts[name] = counts.get(name, 0) + 1
+    for index, name in enumerate(nodes, 1):
+        duplicate = f"  [duplicate x{counts[name]}]" if counts[name] > 1 else ""
+        print(f"{index:4d}  {name}{duplicate}")
+    print(f"\n{len(nodes)} node(s)")
+
+
+def command_rule(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    nodes = get_nodes(args, state, refresh=not args.cached)
+    names = select_names(nodes, args.selectors, args.match)
+    if not names:
+        raise CliError("selection is empty")
+    current = state["rules"].get(args.tag, {"mode": args.rule_command, "names": []})
+    if args.rule_command == "only":
+        current = {"mode": "only", "names": names}
+    else:
+        if current.get("mode") != "exclude":
+            current = {"mode": "exclude", "names": []}
+        current["names"] = list(dict.fromkeys(current.get("names", []) + names))
+    state["rules"][args.tag] = current
+    save_state(Path(args.state), state)
+    print(f"{current['mode']}: {len(current['names'])} node(s)")
+    print("Run 'dae-cli apply TAG' to update the generated dae group.")
+
+
+def command_restore(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    rule = state["rules"].get(args.tag)
+    if not rule:
+        raise CliError(f"no rule exists for {args.tag}")
+    nodes = get_nodes(args, state, refresh=not args.cached)
+    names = set(select_names(nodes, args.selectors, args.match))
+    rule["names"] = [name for name in rule.get("names", []) if name not in names]
+    state["rules"][args.tag] = rule
+    save_state(Path(args.state), state)
+    print(f"{rule['mode']}: {len(rule['names'])} node(s)")
+
+
+def command_reset(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    state["rules"].pop(args.tag, None)
+    save_state(Path(args.state), state)
+    print(f"Rules cleared for {args.tag}.")
+
+
+def command_status(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    rule = state["rules"].get(args.tag, {"mode": "all", "names": []})
+    print(f"subscription: {args.tag}")
+    print(f"mode: {rule['mode']}")
+    for name in rule.get("names", []):
+        print(f"  - {name}")
+    profile = state["profiles"].get(args.tag)
+    if profile:
+        print(f"group: {profile['group']}")
+        print(f"output: {profile['output']}")
+
+
+def command_apply(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    group = args.group or DEFAULT_GROUP
+    output = Path(args.output or DEFAULT_OUTPUT)
+    policy = args.policy or "min_moving_avg"
+    if not re.fullmatch(r"[A-Za-z_][\w.-]*", group):
+        raise CliError(f"invalid dae group name: {group!r}")
+    if not re.fullmatch(r"(?:random|min|min_moving_avg|min_avg10|fixed\(\d+\))", policy):
+        raise CliError(f"unsupported dae group policy: {policy!r}")
+    if group in existing_groups(Path(args.config), exclude=output):
+        raise CliError(f"group {group!r} already exists outside {output}; choose another --group")
+    rule = state["rules"].get(args.tag, {"mode": "all", "names": []})
+    content = generated_config(args.tag, group, policy, rule)
+    previous = output.read_bytes() if output.exists() else None
+    atomic_write(output, content)
+    print(f"wrote {output}")
+    included = output.resolve() in {path.resolve() for path in config_files(Path(args.config))}
+    if not included:
+        print(
+            f"warning: {output} is not included by {args.config}; add it to an include block",
+            file=sys.stderr,
+        )
+    else:
+        try:
+            validate_and_reload(args, args.reload)
+        except CliError:
+            if previous is None:
+                output.unlink(missing_ok=True)
+            else:
+                atomic_write(output, previous.decode("utf-8"))
+            print(f"restored previous {output}", file=sys.stderr)
+            raise
+    state["profiles"][args.tag] = {"group": group, "output": str(output), "policy": policy}
+    save_state(Path(args.state), state)
+
+
+def prompt(prompt_text: str) -> str:
+    try:
+        return input(prompt_text).strip()
+    except (EOFError, KeyboardInterrupt) as exc:
+        print()
+        raise CliError("operation cancelled") from exc
+
+
+def prompt_index(prompt_text: str, count: int) -> int:
+    while True:
+        answer = prompt(prompt_text)
+        if answer.isdigit() and 1 <= int(answer) <= count:
+            return int(answer) - 1
+        print(f"请输入 1-{count}。")
+
+
+def prompt_yes_no(prompt_text: str, default: bool = True) -> bool:
+    suffix = " [Y/n] " if default else " [y/N] "
+    while True:
+        answer = prompt(prompt_text + suffix).lower()
+        if not answer:
+            return default
+        if answer in {"y", "yes", "是"}:
+            return True
+        if answer in {"n", "no", "否"}:
+            return False
+        print("请输入 y 或 n。")
+
+
+def print_node_selection(nodes: list[str], rule: dict[str, Any]) -> None:
+    mode = rule.get("mode", "all")
+    selected = set(rule.get("names", []))
+    for index, name in enumerate(nodes, 1):
+        enabled = mode == "all" or (name in selected if mode == "only" else name not in selected)
+        marker = "[x]" if enabled else "[ ]"
+        print(f"{marker} {index:4d}  {name}")
+
+
+def command_interactive(args: argparse.Namespace, state: dict[str, Any]) -> None:
+    subscriptions = {
+        tag: item for tag, item in read_subscriptions(Path(args.config)).items() if item["tagged"]
+    }
+    if not subscriptions:
+        raise CliError("配置中没有带标签的订阅")
+
+    print("\ndae 订阅节点管理\n")
+    tags = list(subscriptions)
+    for index, tag in enumerate(tags, 1):
+        print(f"{index:3d}. {tag}")
+    tag = tags[prompt_index("\n选择订阅编号: ", len(tags))]
+    args.tag = tag
+    print(f"\n正在获取 {tag} 的节点...")
+    nodes = get_nodes(args, state, refresh=True)
+    print(f"获取到 {len(nodes)} 个节点。\n")
+
+    print("1. 使用全部节点")
+    print("2. 排除部分节点")
+    print("3. 仅使用选中的节点")
+    print("4. 保持当前规则")
+    mode_choice = prompt_index("\n选择模式: ", 4)
+
+    if mode_choice == 0:
+        state["rules"].pop(tag, None)
+        rule = {"mode": "all", "names": []}
+    elif mode_choice in {1, 2}:
+        for index, name in enumerate(nodes, 1):
+            print(f"{index:4d}  {name}")
+        raw = prompt("\n输入节点编号或范围，例如 1 3-5（可留空）: ")
+        selectors = [part for part in re.split(r"[,\s]+", raw) if part]
+        regex = prompt("名称正则（可留空，例如 香港|日本）: ")
+        names = select_names(nodes, selectors, [regex] if regex else [])
+        if mode_choice == 2 and not names:
+            raise CliError("“仅使用”模式至少需要选择一个节点")
+        rule = {"mode": "exclude" if mode_choice == 1 else "only", "names": names}
+        state["rules"][tag] = rule
+    else:
+        rule = state["rules"].get(tag, {"mode": "all", "names": []})
+
+    print("\n生效预览（[x] 表示会被使用）:\n")
+    print_node_selection(nodes, rule)
+    print(f"\n目标文件: {DEFAULT_OUTPUT}")
+    print(f"分组名称: {DEFAULT_GROUP}")
+    if not prompt_yes_no("写入配置吗？"):
+        print("未写入配置。")
+        return
+
+    args.group = DEFAULT_GROUP
+    args.output = DEFAULT_OUTPUT
+    args.policy = "min_moving_avg"
+    args.reload = prompt_yes_no("写入后立即热加载 dae 吗？")
+    command_apply(args, state)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="dae-cli", description=__doc__)
+    parser.add_argument("-c", "--config", default="/etc/dae/config.dae", help="dae entry config")
+    parser.add_argument("--state", default=str(default_state_path()), help="CLI state file")
+    parser.add_argument("--dae-bin", default="dae", help="dae executable")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    sub = parser.add_subparsers(dest="command")
+
+    interactive = sub.add_parser("interactive", aliases=["i"], help="interactive node selection")
+    interactive.set_defaults(func=command_interactive)
+
+    subs = sub.add_parser("subs", aliases=["subscriptions"], help="list subscriptions")
+    subs.set_defaults(func=command_subs)
+
+    nodes = sub.add_parser("nodes", help="list node names")
+    nodes.add_argument("tag")
+    nodes.add_argument("--cached", action="store_true", help="use the last fetched node list")
+    nodes.set_defaults(func=command_nodes)
+
+    for command, help_text in (("exclude", "add nodes to the exclusion list"), ("only", "replace the allowlist")):
+        rule = sub.add_parser(command, help=help_text)
+        rule.add_argument("tag")
+        rule.add_argument("selectors", nargs="*", help="exact names, numbers, or ranges such as 2-5")
+        rule.add_argument("-m", "--match", action="append", default=[], help="select names by regex")
+        rule.add_argument("--cached", action="store_true")
+        rule.set_defaults(func=command_rule, rule_command=command)
+
+    restore = sub.add_parser("restore", help="remove nodes from the current only/exclude rule")
+    restore.add_argument("tag")
+    restore.add_argument("selectors", nargs="*")
+    restore.add_argument("-m", "--match", action="append", default=[])
+    restore.add_argument("--cached", action="store_true")
+    restore.set_defaults(func=command_restore)
+
+    reset = sub.add_parser("reset", help="clear rules for a subscription")
+    reset.add_argument("tag")
+    reset.set_defaults(func=command_reset)
+
+    status = sub.add_parser("status", help="show current rules")
+    status.add_argument("tag")
+    status.set_defaults(func=command_status)
+
+    apply = sub.add_parser("apply", help="write the managed dae group")
+    apply.add_argument("tag")
+    apply.add_argument("--group", help=f"managed group name (default: {DEFAULT_GROUP})")
+    apply.add_argument("--output", help="generated config file")
+    apply.add_argument("--policy", help="dae group policy")
+    apply.add_argument("--reload", action="store_true", help="reload dae after validation")
+    apply.set_defaults(func=command_apply)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    try:
+        state = load_state(Path(args.state))
+        if args.command is None:
+            command_interactive(args, state)
+        else:
+            args.func(args, state)
+        return 0
+    except (CliError, OSError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
