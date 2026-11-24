@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any
 
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 MAX_SUBSCRIPTION_SIZE = 10 * 1024 * 1024
 DEFAULT_GROUP = "proxy"
 DEFAULT_OUTPUT = "/etc/dae/config.d/50-group.dae"
@@ -654,12 +654,15 @@ KEY_SEQUENCES = {
     b"[F": "end",
     b"[1~": "home",
     b"[4~": "end",
+    b"[C": "right",
+    b"[D": "back",
     b"OA": "up",
     b"OB": "down",
+    b"OD": "back",
     b"OH": "home",
     b"OF": "end",
 }
-TUI_HINT = "↑↓ / j k 选择    Enter 确认    q 退出"
+TUI_HINT = "↑↓ / j k 移动    Enter 选择    Esc / ← 返回上一级    q 退出"
 
 
 def tui_available() -> bool:
@@ -682,12 +685,14 @@ def read_key(fd: int = 0) -> str:
         char = os.read(fd, 1)
     except OSError:
         return "quit"
-    if not char or char == b"\x03":
-        return "quit"
+    if not char:
+        return "back"
+    if char == b"\x03":
+        return "abort"
     if char == b"\x1b":
         ready, _, _ = select.select([fd], [], [], 0.05)
         if not ready:
-            return "esc"
+            return "back"
         seq = os.read(fd, 1)
         if seq in (b"[", b"O"):
             ready, _, _ = select.select([fd], [], [], 0.05)
@@ -701,8 +706,12 @@ def read_key(fd: int = 0) -> str:
         return KEY_SEQUENCES.get(seq, "other")
     if char in (b"\r", b"\n", b" "):
         return "enter"
+    if char in (b"\x08", b"\x7f"):  # Backspace
+        return "back"
     if char in (b"q", b"Q"):
         return "quit"
+    if char in (b"h", b"H"):
+        return "back"
     if char in (b"j", b"J"):
         return "down"
     if char in (b"k", b"K"):
@@ -740,7 +749,7 @@ def pick_numbered(title: str, items: list[str], hint: str = "") -> int | None:
         print(f"   {number}) {text}")
     if hint:
         print(f"   {hint}")
-    answer = (prompt("选择（0 取消）[0]: ") or "0").strip()
+    answer = (prompt("选择（0 返回）[0]: ") or "0").strip()
     if not answer.isdigit() or not 1 <= int(answer) <= len(items):
         return None
     return int(answer) - 1
@@ -761,7 +770,9 @@ def pick(title: str, items: list[str], hint: str = TUI_HINT, index: int = 0) -> 
         while True:
             draw_screen(title, items, index, hint)
             key = read_key(fd)
-            if key in ("quit", "esc"):
+            if key in ("abort", "quit"):
+                raise SystemExit(0)
+            if key == "back":
                 return None
             if key == "enter":
                 return index
@@ -788,7 +799,6 @@ def print_node_selection(nodes: list[str], rule: dict[str, Any]) -> None:
 
 
 NODE_MODES = ["使用全部节点", "排除部分节点", "仅使用选中的节点", "保持当前规则"]
-BACK = "← 返回"
 
 
 def _node_rule_step(args: argparse.Namespace, state: dict[str, Any], tag: str) -> bool:
@@ -802,8 +812,8 @@ def _node_rule_step(args: argparse.Namespace, state: dict[str, Any], tag: str) -
     nodes = get_nodes(args, state, refresh=True)
     print(f"获取到 {len(nodes)} 个节点。\n")
 
-    mode_choice = pick(f"{tag} — 规则模式", NODE_MODES + [BACK])
-    if mode_choice is None or mode_choice == len(NODE_MODES):
+    mode_choice = pick(f"{tag} — 规则模式", NODE_MODES)
+    if mode_choice is None:
         return False
 
     if mode_choice == 0:
@@ -853,8 +863,8 @@ def command_node_flow(args: argparse.Namespace, state: dict[str, Any]) -> None:
         if fixed:
             tag = fixed
         else:
-            choice = pick("dae 订阅节点管理 — 选择订阅", tags + [BACK])
-            if choice is None or choice == len(tags):
+            choice = pick("dae 订阅节点管理 — 选择订阅", tags)
+            if choice is None:
                 print("已返回。")
                 return
             tag = tags[choice]
@@ -1133,9 +1143,9 @@ def command_sub_menu(args: argparse.Namespace, state: dict[str, Any]) -> None:
         for tag in tags:
             cached = len(state.get("nodes", {}).get(tag, []))
             rows.append(f"{tag:<14} {cached or '-':>4} 节点   {mask_url(subscriptions[tag]['url'])}")
-        rows += ["＋ 新增订阅", "⟳ 刷新节点数", "← 返回"]
+        rows += ["＋ 新增订阅", "⟳ 刷新节点数"]
         choice = pick(f"订阅管理  ({entry})", rows)
-        if choice is None or choice == len(tags) + 2:
+        if choice is None:
             return
         namespace = argparse.Namespace(**{**vars(args), "tag": None})
         try:
@@ -1144,8 +1154,6 @@ def command_sub_menu(args: argparse.Namespace, state: dict[str, Any]) -> None:
                 command_sub(namespace, state)
             elif choice == len(tags) + 1:
                 refresh_all_counts(args, state)
-            elif choice == len(tags) + 2:
-                return
             else:
                 tag = tags[choice]
                 action = pick(
@@ -1307,9 +1315,8 @@ def command_edit(args: argparse.Namespace, state: dict[str, Any]) -> None:
             except OSError:
                 stamp = "?"
             rows.append(f"{path.name:<20} {describe_config(path):<26} {stamp}")
-        rows.append("← 返回")
         choice = pick(f"编辑配置文件  ({entry})", rows)
-        if choice is None or choice == len(files):
+        if choice is None:
             print("已返回。")
             return
         target = files[choice]

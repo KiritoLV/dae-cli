@@ -206,13 +206,14 @@ dae-cli
   节点规则（选择哪些节点进代理组）
   编辑配置文件（global / dns / routing …）
   退出
-↑↓ / j k 选择    Enter 确认    q 退出
+↑↓ / j k 移动    Enter 选择    Esc / ← 返回上一级    q 退出
 ```
 
-- `↑ ↓` / `j k` move, `Home` / `End` / `g` / `G` jump, `Enter` selects, `q` / `Esc` / `Ctrl-C` leaves;
-- **every list has a `← 返回` row at the bottom** and `q` / `Esc` is the same as picking it — you can
-  always climb back one level, and finishing an action (write / delete / apply) drops you back at
-  the list you came from instead of quitting the program;
+- keys: `↑ ↓` / `j k` move, `Home` / `End` / `g` / `G` jump, `Enter` selects,
+  **`Esc` / `←` / `h` / `Backspace` goes back one level**, `q` / `Ctrl-C` quits the program from
+  anywhere (no "back" row eating a line in every list);
+- finishing an action (write / delete / apply) drops you back at the list you came from instead of
+  quitting;
 - the screen is redrawn in place (cursor home + per-line clear), so nothing scrolls away and the
   previous menu does not pile up in your scrollback;
 - subscription management is one flat list: pick a subscription, then
