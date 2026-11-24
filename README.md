@@ -28,6 +28,7 @@ anything. So the NOPASSWD rule points at a **root-owned wrapper** instead:
 |---|---|---|
 | `/usr/local/sbin/dae-cli-menu` | root, 0755 | subcommand allowlist; rejects any argument starting with `-` except `--reload` / `--cached` |
 | `/usr/local/libexec/dae-cli/dae_cli.py` | root, 0755 | the CLI; you cannot edit it |
+| `/usr/local/libexec/dae-cli/daed-sub/` | root, 0755 | the `ds` converter (unprivileged — never run it via sudo) |
 | `/etc/sudoers.d/dae-cli-<user>` | root, 0440 | `NOPASSWD: /usr/local/sbin/dae-cli-menu` and nothing else |
 
 The allowlist matters because the CLI itself has root-capable options
@@ -113,6 +114,32 @@ include {
 
 Because the group is named `proxy` by default, an existing `fallback: proxy` routing rule
 keeps working unchanged.
+
+## ds: convert a Clash subscription for daed
+
+`daed-sub/daed-sub-manager.sh` (installed to `/usr/local/libexec/dae-cli/daed-sub/`) is the
+companion tool for providers that only hand out **Clash YAML**:
+
+```console
+$ ds status          # what is bound, node count, is the local server up
+$ ds bind            # paste the subscription URL (prompted, so it stays out of shell history)
+$ ds update          # fetch + convert again
+$ ds up              # update, then start the local HTTP server
+$ ds start|stop|restart
+$ ds                 # interactive menu
+```
+
+It converts the YAML to a plain URI list, serves it on `http://127.0.0.1:18080/links.txt`
+as a **systemd --user** unit, and you point daed's subscription at that URL — so daed never
+needs to understand Clash YAML itself.
+
+Privacy / safety notes:
+
+- the bound URL is stored `0600` in `~/.local/share/daed-sub-manager/subscription.url`,
+  and `ds status` only prints a masked form;
+- it runs entirely inside your home directory: **never run `ds` via sudo**, it would write
+  root-owned files into `/root` and the user unit would stop matching;
+- the local server binds `127.0.0.1` only.
 
 ## Supported subscription formats
 

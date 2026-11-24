@@ -90,7 +90,8 @@ do_status() {
 
     local f found=0 unreadable_dir=0
     [[ -x $SUDOERS_DIR ]] || unreadable_dir=1     # 普通用户连目录都进不去
-    for f in "$ENTRY" "$CLI" "$sudoers_file"; do
+    for f in "$ENTRY" "$CLI" "$LIB_DIR/daed-sub/daed-sub-manager.sh" \
+             "$LIB_DIR/daed-sub/clash_yaml_to_daed.py" "$sudoers_file"; do
         if [[ -e $f ]]; then
             found=$((found + 1))
             printf '    [ok]      %s\n' "$f"
@@ -139,6 +140,15 @@ do_install() {
     say "installing entry point to $ENTRY"
     run install -o root -g root -m 0755 "$SCRIPT_DIR/dae-cli-menu" "$ENTRY"
 
+    # daed-sub (the "ds" subscription converter) is unprivileged, but installing it
+    # root-owned keeps it from being tampered with. It must NOT be run via sudo.
+    say "installing daed-sub manager to $LIB_DIR/daed-sub"
+    run install -d -o root -g root -m 0755 "$LIB_DIR/daed-sub"
+    run install -o root -g root -m 0755 "$SCRIPT_DIR/daed-sub/daed-sub-manager.sh" \
+        "$LIB_DIR/daed-sub/daed-sub-manager.sh"
+    run install -o root -g root -m 0755 "$SCRIPT_DIR/daed-sub/clash_yaml_to_daed.py" \
+        "$LIB_DIR/daed-sub/clash_yaml_to_daed.py"
+
     say "writing sudoers rule for '$TARGET_USER' to $sudoers_file"
     local tmp
     tmp="$(mktemp)"
@@ -161,12 +171,13 @@ EOF
 Installed. Add the short command to your shell (zsh / bash):
 
     dm() { sudo -n /usr/local/sbin/dae-cli-menu "\$@"; }
+    ds() { /usr/local/libexec/dae-cli/daed-sub/daed-sub-manager.sh "\$@"; }
 
 then:
 
     source ~/.zshrc      # or ~/.bashrc
     dm help
-    dm subs
+    ds status            # NOTE: never run ds through sudo
 
 The state file lives in YOUR home (~/.config/dae-cli/state.json) even when run
 via sudo, and it stores node display names -- treat it as private.
